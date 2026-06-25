@@ -92,9 +92,7 @@ function render(): void {
   saveBtn.disabled = !state.tracts
   for (const t of tabEls) {
     const n = Number(t.dataset.tab)
-    t.disabled =
-      (n === 2 && !state.maps) ||
-      (n === 3 && !state.streamlines && !state.tracts)
+    t.disabled = (n === 2 && !state.maps) || (n === 3 && !state.tracts)
   }
 }
 
@@ -197,7 +195,6 @@ async function loadInputFiles(filesPromise: Promise<File[]>): Promise<void> {
   // A new load relocks tabs 2–3 and invalidates any downstream progress.
   state.input = undefined
   state.maps = undefined
-  state.streamlines = undefined
   state.tracts = undefined
   gotoTab(1)
   busy(true)
@@ -298,9 +295,16 @@ async function makeBrainMask(
   const b0 = await cropFirstVolume(input)
   if (seq !== loadSeq) return null
   const { prepareInput, buildMaskNifti } = await import('./dwi2trx/mindgrab')
-  await nv.loadVolumes([{ url: b0, name: 'b0.nii.gz' }]) // transient: NVImage for conform
-  const b0Img = nv.volumes[0] // capture now, before any later canvas swap
-  shownView = null
+  // Load the transient b0 (just to get a parsed NVImage for conform) serialized
+  // on the canvas chain, so it can't interleave with a navigation swap if a new
+  // DWI is dropped mid-fit. Capture the NVImage inside the serialized step; the
+  // reference stays valid even after a later swap replaces nv.volumes.
+  const b0Img = await runOnCanvas(async () => {
+    await nv.loadVolumes([{ url: b0, name: 'b0.nii.gz' }])
+    shownView = null
+    return nv.volumes[0]
+  })
+  if (seq !== loadSeq) return null // superseded during the transient load
   const { conformed, img32 } = await prepareInput(maskCtx, b0Img)
   const [labels] = await inferer(img32)
   return new File([buildMaskNifti(conformed, labels)], 'maskconf.nii')
@@ -317,7 +321,6 @@ async function loadInput(
   if (seq !== loadSeq) return // superseded by a newer load
   state.input = { ...r, source }
   state.maps = undefined // new input invalidates any prior tensor fit
-  state.streamlines = undefined
   state.tracts = undefined
   shownView = null // force the input view to (re)load through the chain
   gotoTab(1) // enables the Fit button, relocks tabs 2–3
@@ -363,8 +366,7 @@ async function runFit(): Promise<void> {
     const maps = await fitTensor(input, maskConf)
     if (seq !== loadSeq) return // a newer input superseded this fit — discard
     state.maps = maps
-    state.streamlines = undefined // a new fit invalidates old streamlines + TRX
-    state.tracts = undefined
+    state.tracts = undefined // a new fit invalidates the old TRX
     shownView = null // force showMaps to (re)load
     gotoTab(2) // unlock + switch to the Tensor maps tab
     await syncView()
@@ -403,7 +405,7 @@ async function runTrack(): Promise<void> {
   let device: GPUDevice | null = null
   try {
     const [
-      { getTrackingDevice, trackStreamlines, DEFAULT_PARAMS },
+      { getTrackingDevice, trackStreamlines, DEFAULT_PARAMS, isOomError },
       inputsMod,
       { loadSphere },
       { writeTrx },
@@ -430,6 +432,10 @@ async function runTrack(): Promise<void> {
       bvalText,
       bvecText,
       sphere,
+      Math.min(
+        device.limits.maxStorageBufferBindingSize,
+        device.limits.maxBufferSize,
+      ),
     )
     if (seq !== loadSeq) return
     // Tracking knobs from the UI (clamped to the input ranges).
@@ -464,7 +470,7 @@ async function runTrack(): Promise<void> {
       // fragment is noise that bloats the TRX and clutters the render).
       minPts: Math.max(2, Math.ceil(5 / stepSize)),
     }
-    const lines = await trackStreamlines(
+    const { lines, truncated, processedSeeds } = await trackStreamlines(
       device,
       tInputs,
       seeds,
@@ -475,6 +481,7 @@ async function runTrack(): Promise<void> {
             `Tracking… ${done.toLocaleString()} / ${total.toLocaleString()} seeds`,
           )
       },
+      () => seq !== loadSeq, // stop promptly if a new DWI was dropped mid-track
     )
     if (seq !== loadSeq) return
     if (lines.length === 0) {
@@ -484,22 +491,59 @@ async function runTrack(): Promise<void> {
       )
       return
     }
-    state.streamlines = lines
     const trxName = `${baseName(input.nifti.name) || 'streamlines'}.trx`
-    state.tracts = new File([writeTrx(lines, voxelToRasmm, dims3)], trxName)
     const totalPts = lines.reduce((s, l) => s + l.length / 3, 0)
     const meanLen = (totalPts / lines.length).toFixed(1)
+    const count = lines.length.toLocaleString()
+    state.tracts = new File([writeTrx(lines, voxelToRasmm, dims3)], trxName)
+    // Free the voxel-space lines now that the TRX is serialized — the 3D preview
+    // below allocates a large cylinder mesh, and there is no need to hold both.
+    lines.length = 0
+    const note = truncated
+      ? ' PARTIAL (out of memory) — raise the Seed/Stop FA thresholds or lower Density for the full set.'
+      : capped
+        ? ' Seeds capped at 100,000 — lower Density for full coverage.'
+        : ''
+    const seedNote = truncated
+      ? `${processedSeeds.toLocaleString()} of ${nSeeds.toLocaleString()} seeds`
+      : `${nSeeds.toLocaleString()} seeds`
+    const summary =
+      `${count} streamlines from ${seedNote} ` +
+      `(mean ${meanLen} pts) — saved as TRX.${note}`
     gotoTab(3)
     shownView = null // force the tract render to load
-    await syncView()
-    if (seq !== loadSeq) return
-    setStatus(
-      `${lines.length.toLocaleString()} streamlines from ${nSeeds.toLocaleString()} seeds ` +
-        `(mean ${meanLen} pts) — saved as TRX.${capped ? ' Seeds capped at 100,000 — lower Density for full coverage.' : ''}`,
-    )
+    // The TRX is already built and saveable. The 3D preview is separate: NiiVue
+    // turns every streamline into a cylinder mesh (millions of vertices), which
+    // can exhaust memory on a big tractogram even though the tracking itself
+    // succeeded. Catch that so a render OOM doesn't masquerade as a tracking
+    // failure and the user can still download their TRX.
+    try {
+      await syncView()
+      if (seq !== loadSeq) return
+      setStatus(summary)
+    } catch (renderErr) {
+      if (seq !== loadSeq) return
+      console.warn('[dwi2trx] tract render failed:', renderErr)
+      render() // keep “Save TRX” enabled (state.tracts is set)
+      // Distinguish an out-of-memory preview (the expected failure on a huge
+      // tractogram) from any other render error, so a real bug isn't mislabeled
+      // as OOM. Either way the TRX is already built and downloadable.
+      const msg = (renderErr as Error)?.message ?? String(renderErr)
+      const oom = isOomError(renderErr)
+      setStatus(
+        oom
+          ? `${summary} The 3D preview ran out of memory — click “Save TRX” to download it, or raise the Seed/Stop FA thresholds to render fewer streamlines.`
+          : `${summary} The 3D preview failed (${msg}) — your TRX is saved; click “Save TRX” to download it.`,
+        true,
+      )
+    }
   } catch (err) {
     if (seq === loadSeq)
-      setStatus(`Streamline tracking failed: ${(err as Error).message}`, true)
+      setStatus(
+        `Streamline tracking failed: ${(err as Error).message} ` +
+          '(hint: raise the Seed and Stop FA thresholds, or lower Density/step size, to use less memory).',
+        true,
+      )
   } finally {
     device?.destroy() // free the WebGPU device on every path (incl. errors)
     tracking = false
@@ -517,6 +561,18 @@ let viewChain: Promise<void> = Promise.resolve()
 function syncView(): Promise<void> {
   viewChain = viewChain.then(doSyncView, doSyncView)
   return viewChain
+}
+
+/** Run a canvas operation serialized on the same chain as syncView, so a
+ *  transient load (e.g. the mindgrab b0) can't interleave with a navigation
+ *  swap and corrupt nv.volumes. Returns the op's result. */
+function runOnCanvas<T>(fn: () => Promise<T>): Promise<T> {
+  const run = viewChain.then(fn, fn)
+  viewChain = run.then(
+    () => {},
+    () => {},
+  )
+  return run
 }
 
 /** Fire-and-forget syncView for navigation, surfacing any display error. */

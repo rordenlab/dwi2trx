@@ -145,6 +145,9 @@ export async function fitTensor(
         // morphological close before the output, e.g.
         //   ['maskconf.nii', '-reslice_nn', 'b0.nii.gz', '-close', '1', '2', '0', 'mask.nii.gz']
         // (`-close 1 <border_mm> 0` = binarize at 1, dilate border_mm, erode 0).
+        // The b0 is often qform-only (FSL-preprocessed DWI, sform_code=0); niimath
+        // now fills a missing sform from the qform on read, so its reslice (which
+        // reads the sform matrix) aligns correctly. See vendor/niimath.
         run(mod, ['dwi.nii.gz', '-crop', '0', '1', 'b0.nii.gz'], 'extract b0')
         mod.FS_createDataFile(
           '.',

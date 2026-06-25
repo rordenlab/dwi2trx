@@ -16,8 +16,18 @@
  * golden-tested in tracking.test.ts; this orchestration is verified in-browser.
  */
 
+import {
+  growChunkSize,
+  isDeviceLost,
+  isOomError,
+  nextChunkSize,
+  planBatchError,
+} from './backoff'
 import { BLOCK_Y, divUp, MAX_SLINE_LEN, REAL_SIZE } from './globals'
 import { BOOT_ENTRY_GEN, BOOT_ENTRY_GETNUM, bootShaderSource } from './shaders'
+
+// Re-exported so the UI (main.ts) can classify a render OOM the same way.
+export { isOomError }
 
 /** Static per-dataset inputs uploaded once. `dataf` is the DWI signal in
  *  (x,y,z,t) C-contiguous order (t fastest); the OPDT matrices come straight
@@ -49,7 +59,7 @@ export interface TrackingParams {
   minSeparationAngle: number // radians (default radians(45))
   minSignal: number // default 1
   rngSeed: number
-  chunkSize: number // seeds per GPU batch (default 25000)
+  chunkSize: number // seeds per GPU batch (default 10000)
   minPts: number // discard streamlines shorter than this
   maxPts: number // discard streamlines longer than this
 }
@@ -61,7 +71,12 @@ export const DEFAULT_PARAMS: Omit<TrackingParams, 'tcThreshold'> = {
   minSeparationAngle: (45 * Math.PI) / 180,
   minSignal: 1,
   rngSeed: 0,
-  chunkSize: 25000,
+  // Each chunk reads its streamline buffer back to the host whole — sized at the
+  // worst case of MAX_SLINE_LEN points × streamlines-in-chunk. Dense seeding on a
+  // big brain can yield ~4 streamlines/seed, so 25k seeds/chunk was a ~1.3 GB
+  // host ArrayBuffer that fails to allocate ("Array buffer allocation failed").
+  // 10k keeps the peak readback ~0.5 GB; total streamlines are unaffected.
+  chunkSize: 10000,
   minPts: 0,
   maxPts: Number.POSITIVE_INFINITY,
 }
@@ -179,18 +194,20 @@ function emptyStorage(
   })
 }
 
-/** Copy a storage buffer's first `byteLength` bytes back to the CPU. */
+/** Copy `byteLength` bytes from `buf` (starting at `srcOffset`) back to the CPU.
+ *  `srcOffset` + `byteLength` must be multiples of 4. */
 async function readback(
   device: GPUDevice,
   buf: GPUBuffer,
   byteLength: number,
+  srcOffset = 0,
 ): Promise<ArrayBuffer> {
   const staging = device.createBuffer({
     size: byteLength,
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
   })
   const enc = device.createCommandEncoder()
-  enc.copyBufferToBuffer(buf, 0, staging, 0, byteLength)
+  enc.copyBufferToBuffer(buf, srcOffset, staging, 0, byteLength)
   device.queue.submit([enc.finish()])
   try {
     await staging.mapAsync(GPUMapMode.READ)
@@ -270,23 +287,68 @@ function packBootParams(
   return buf
 }
 
-/** Concatenate typed arrays into one Float32Array (for the packed buffers). */
-function concatF32(...arrs: Array<ArrayLike<number>>): Float32Array {
+/** Upload several Float32 arrays as one storage buffer, writing each directly
+ *  into the mapped GPU range — no intermediate host concat. The combined size is
+ *  checked BEFORE any allocation, so a too-large DWI gets an actionable message
+ *  instead of exhausting JS memory in the concat or a generic WebGPU failure. */
+function storageFromParts(
+  device: GPUDevice,
+  parts: Float32Array[],
+  label: string,
+  limitBytes: number,
+): GPUBuffer {
   let n = 0
-  for (const a of arrs) n += a.length
-  const out = new Float32Array(n)
-  let o = 0
-  for (const a of arrs) {
-    out.set(a as never, o)
-    o += a.length
+  for (const p of parts) n += p.length
+  const bytes = n * 4
+  if (bytes > limitBytes) {
+    throw new Error(
+      `${label} needs ${(bytes / 1e9).toFixed(1)} GB, over this GPU's ` +
+        `${(limitBytes / 1e9).toFixed(1)} GB buffer limit — the DWI is too large for this GPU.`,
+    )
   }
-  return out
+  const buf = device.createBuffer({
+    size: Math.max(bytes, 4),
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    mappedAtCreation: true,
+    label,
+  })
+  const view = new Float32Array(buf.getMappedRange())
+  let o = 0
+  for (const p of parts) {
+    view.set(p, o)
+    o += p.length
+  }
+  buf.unmap()
+  return buf
 }
+
+/** Result of trackStreamlines. `truncated` is true when the run stopped early
+ *  (host/GPU memory) so the streamlines are only partial; `processedSeeds` is how
+ *  many of `totalSeeds` were actually tracked (equal on a complete run). */
+export interface TrackResult {
+  lines: Float32Array[]
+  truncated: boolean
+  processedSeeds: number
+  totalSeeds: number
+}
+
+/** Cap a single host/GPU streamline readback so peak memory is bounded by this,
+ *  not by chunk size — slices are pulled back one window at a time. */
+const READBACK_WINDOW_BYTES = 128 * 1024 * 1024
 
 /**
  * Track streamlines from `seeds` (nseeds × 3 voxel coords, flat Float32Array).
  * Returns one Float32Array per surviving streamline (flat x,y,z points, length
  * 3·npts), in VOX space. `onProgress(done, total)` is called per chunk.
+ *
+ * Memory is bounded two ways: each batch's streamline buffer is read back in
+ * fixed windows (READBACK_WINDOW_BYTES), and a batch that still hits an
+ * out-of-memory error is retried with a halved seed count (down to MIN_CHUNK)
+ * before, as a last resort, returning the streamlines gathered so far with
+ * `truncated = true` — a partial tractogram beats none.
+ *
+ * `shouldStop()` is polled between batches so a superseded run (a new DWI
+ * dropped mid-track) stops promptly and frees its GPU buffers.
  */
 export async function trackStreamlines(
   device: GPUDevice,
@@ -294,7 +356,8 @@ export async function trackStreamlines(
   seeds: Float32Array,
   params: TrackingParams,
   onProgress?: (done: number, total: number) => void,
-): Promise<Float32Array[]> {
+  shouldStop?: () => boolean,
+): Promise<TrackResult> {
   const nSeedsTotal = seeds.length / 3
   const off = modelOffsets(inputs)
 
@@ -309,17 +372,32 @@ export async function trackStreamlines(
     return b
   }
   const out: Float32Array[] = []
+  let truncated = false
   let rngOffset = 0
+  let processedSeeds = 0
   const maxBinding = device.limits.maxStorageBufferBindingSize
+  const maxBuffer = device.limits.maxBufferSize
+  // A storage buffer must fit both the per-binding and per-buffer GPU limits.
+  const gpuLimit = Math.min(maxBinding, maxBuffer)
 
   try {
+    // Big inputs are checked (and the combined size validated) BEFORE allocating,
+    // so a too-large DWI reports an actionable limit error rather than blowing up
+    // in a host concat or a generic WebGPU failure.
     const datafBuf = stat(
-      storageFromData(
+      storageFromParts(
         device,
-        concatF32(inputs.dataf, inputs.sphereVertices),
-        'dataf+verts',
+        [inputs.dataf, inputs.sphereVertices],
+        'DWI signal buffer',
+        gpuLimit,
       ),
     )
+    if (inputs.metricMap.byteLength > gpuLimit) {
+      throw new Error(
+        `FA map buffer needs ${(inputs.metricMap.byteLength / 1e9).toFixed(1)} GB, over ` +
+          `this GPU's ${(gpuLimit / 1e9).toFixed(1)} GB buffer limit — the DWI is too large for this GPU.`,
+      )
+    }
     const metricBuf = stat(
       storageFromData(device, inputs.metricMap, 'metric_map'),
     )
@@ -327,17 +405,18 @@ export async function trackStreamlines(
       storageFromData(device, inputs.sphereEdges, 'sphere_edges'),
     )
     const modelBuf = stat(
-      storageFromData(
+      storageFromParts(
         device,
-        concatF32(
+        [
           inputs.H,
           inputs.R,
           inputs.deltaB,
           inputs.deltaQ,
           inputs.samplingMatrix,
           Float32Array.from(inputs.b0sMask),
-        ),
-        'modelData',
+        ],
+        'model buffer',
+        gpuLimit,
       ),
     )
 
@@ -352,8 +431,15 @@ export async function trackStreamlines(
       compute: { module, entryPoint: BOOT_ENTRY_GEN },
     })
 
-    for (let start = 0; start < nSeedsTotal; start += params.chunkSize) {
-      const nseeds = Math.min(params.chunkSize, nSeedsTotal - start)
+    // Adaptive seed batching: start at params.chunkSize and, on an out-of-memory
+    // error, halve the batch and retry the SAME seed range (down to MIN_CHUNK)
+    // before giving up — so even a first batch that is too dense to read back can
+    // still make progress instead of failing the whole run.
+    let start = 0
+    let chunkSize = params.chunkSize
+    while (start < nSeedsTotal) {
+      if (shouldStop?.()) break // superseded by a newer load — stop and free GPU
+      const nseeds = Math.min(chunkSize, nSeedsTotal - start)
       const chunk = seeds.subarray(start * 3, (start + nseeds) * 3)
       const gridX = divUp(nseeds, BLOCK_Y)
 
@@ -364,6 +450,9 @@ export async function trackStreamlines(
         perChunk.push(b)
         return b
       }
+      // Stage this batch's streamlines locally and only merge into `out` once the
+      // whole batch reads back — a mid-batch OOM retry must not double-count.
+      const batchOut: Float32Array[] = []
       try {
         const seedsBuf = track(storageFromData(device, chunk, 'seeds'))
         const offsBuf = track(
@@ -405,16 +494,32 @@ export async function trackStreamlines(
         device.queue.writeBuffer(offsBuf, 0, offsets)
 
         if (nSlines > 0) {
-          const slineBytes = 2 * 3 * MAX_SLINE_LEN * nSlines * REAL_SIZE
+          const stride = MAX_SLINE_LEN * 2 * 3
+          const slineBytes = stride * nSlines * REAL_SIZE
           if (slineBytes > maxBinding) {
-            const maxSlines = Math.floor(
-              maxBinding / (2 * 3 * MAX_SLINE_LEN * REAL_SIZE),
-            )
+            // Too many streamlines for one GPU buffer — same decision tree as an
+            // OOM: shrink and retry, salvage a partial at the floor, else a hard
+            // "lower the density" error.
+            const plan = planBatchError({
+              oom: true,
+              lost: false,
+              chunkSize,
+              hasOutput: out.length > 0,
+            })
+            if (plan === 'shrink') {
+              chunkSize = nextChunkSize(chunkSize)
+              continue
+            }
+            if (plan === 'salvage') {
+              truncated = true
+              break
+            }
+            const maxSlines = Math.floor(maxBinding / (stride * REAL_SIZE))
             throw new Error(
-              `this seed batch produced ${nSlines.toLocaleString()} streamlines ` +
+              `${nseeds.toLocaleString()} seeds produced ${nSlines.toLocaleString()} streamlines ` +
                 `(${(slineBytes / 1e9).toFixed(1)} GB), over the GPU's ` +
-                `${(maxBinding / 1e9).toFixed(1)} GB buffer limit — reduce the seed ` +
-                `density or chunk size (max ~${maxSlines.toLocaleString()} streamlines/chunk).`,
+                `${(maxBinding / 1e9).toFixed(1)} GB buffer limit — lower the seed density ` +
+                `(max ~${maxSlines.toLocaleString()} streamlines/batch).`,
             )
           }
           // Interleaved [seed, len] per streamline (seed at 2i, len at 2i+1) — one
@@ -454,30 +559,73 @@ export async function trackStreamlines(
             ),
           ])
 
-          const slineData = new Float32Array(
-            await readback(device, slineBuf, slineBytes),
-          )
+          // Read positions back in fixed-size windows so peak host (and staging)
+          // memory is bounded by READBACK_WINDOW_BYTES, not by the whole batch —
+          // the batch buffer reserves MAX_SLINE_LEN points per streamline even
+          // though most are far shorter, so the full copy is the memory bottleneck.
           const meta = new Int32Array(
             await readback(device, slineMetaBuf, 2 * nSlines * 4),
           )
-          const stride = MAX_SLINE_LEN * 2 * 3
-          for (let jj = 0; jj < nSlines; jj++) {
-            const npts = meta[2 * jj + 1] // odd entries are lengths
-            if (npts <= 0 || npts < params.minPts || npts > params.maxPts)
-              continue
-            out.push(slineData.slice(jj * stride, jj * stride + npts * 3))
+          const winSlines = Math.max(
+            1,
+            Math.floor(READBACK_WINDOW_BYTES / (stride * REAL_SIZE)),
+          )
+          for (let base = 0; base < nSlines; base += winSlines) {
+            if (shouldStop?.()) break // superseded mid-readback — abort this batch
+            const n = Math.min(winSlines, nSlines - base)
+            const data = new Float32Array(
+              await readback(
+                device,
+                slineBuf,
+                n * stride * REAL_SIZE,
+                base * stride * REAL_SIZE,
+              ),
+            )
+            for (let jj = 0; jj < n; jj++) {
+              const npts = meta[2 * (base + jj) + 1] // odd entries are lengths
+              if (npts <= 0 || npts < params.minPts || npts > params.maxPts)
+                continue
+              batchOut.push(data.slice(jj * stride, jj * stride + npts * 3))
+            }
           }
         }
+        // A new load arrived during this batch — drop it uncommitted and stop;
+        // the caller discards the whole run via its loadSeq guard.
+        if (shouldStop?.()) break
+        // Batch fully read back — commit it and advance.
+        for (const s of batchOut) out.push(s)
+        rngOffset += nseeds
+        start += nseeds
+        processedSeeds = start
+        onProgress?.(start, nSeedsTotal)
+        // Grow cautiously toward the full batch instead of jumping back to it,
+        // so a GPU where only a reduced batch fits doesn't re-fail full-size
+        // allocations every batch.
+        chunkSize = growChunkSize(chunkSize, params.chunkSize)
+      } catch (err) {
+        const plan = planBatchError({
+          oom: isOomError(err),
+          lost: isDeviceLost(err),
+          chunkSize,
+          hasOutput: out.length > 0,
+        })
+        if (plan === 'shrink') {
+          chunkSize = nextChunkSize(chunkSize) // retry smaller, same seeds
+          continue
+        }
+        if (plan === 'salvage') {
+          truncated = true // at the floor / device lost — keep what we have
+          break
+        }
+        throw err
       } finally {
         for (const b of perChunk) b.destroy()
       }
-      rngOffset += nseeds
-      onProgress?.(Math.min(start + nseeds, nSeedsTotal), nSeedsTotal)
     }
   } finally {
     for (const b of staticBuffers) b.destroy()
   }
-  return out
+  return { lines: out, truncated, processedSeeds, totalSeeds: nSeedsTotal }
 }
 
 function paramsBuffer(device: GPUDevice, bytes: ArrayBuffer): GPUBuffer {

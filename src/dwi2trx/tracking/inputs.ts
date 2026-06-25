@@ -11,50 +11,42 @@
  */
 
 import { gradientTable } from './gradients'
+import { readDataf, readMetric } from './nifti-read'
 import { opdtMatrices } from './opdt'
 import { realShDescoteaux } from './sh'
 import { type Sphere, sphereThetaPhi } from './sphere'
 import type { TrackingInputs } from './tracker'
 
-// --- minimal NIfTI-1 image reader (gzip-aware, applies scl_slope/inter) ---
+// --- gzip-aware whole-file decompression (the NIfTI reader lives in nifti-read) ---
 
-interface NiftiVol {
-  nx: number
-  ny: number
-  nz: number
-  nt: number
-  /** Voxels in raw NIfTI order (x fastest), scaled to real values. */
-  raw: Float32Array
-  /** Voxel→world (RASMM) 4x4 row-major, from the sform (or pixdim fallback). */
-  affine: number[][]
+const tooLargeError = (bytes: number, maxBytes: number): Error =>
+  new Error(
+    `the DWI decompresses to ~${(bytes / 1e9).toFixed(1)} GB, over this GPU's ` +
+      `${(maxBytes / 1e9).toFixed(1)} GB buffer limit — the DWI is too large for this GPU.`,
+  )
+
+/** A gzip member's trailer stores the uncompressed size mod 2³² (ISIZE, little-
+ *  endian). Cheap to peek so we can reject an implausibly large input BEFORE
+ *  decompressing, rather than OOMing mid-inflate. (Exact only below 4 GiB and for
+ *  single-member gzip — fine as a guard, not a precise value.) */
+async function gzipUncompressedSize(file: File): Promise<number> {
+  const tail = new Uint8Array(await file.slice(file.size - 4).arrayBuffer())
+  return (tail[0] | (tail[1] << 8) | (tail[2] << 16) | (tail[3] << 24)) >>> 0
 }
 
-function readAffine(dv: DataView): number[][] {
-  const sformCode = dv.getInt16(254, true)
-  if (sformCode > 0) {
-    const row = (o: number): number[] => [
-      dv.getFloat32(o, true),
-      dv.getFloat32(o + 4, true),
-      dv.getFloat32(o + 8, true),
-      dv.getFloat32(o + 12, true),
-    ]
-    return [row(280), row(296), row(312), [0, 0, 0, 1]] // srow_x / y / z
-  }
-  // No sform: fall back to a pixdim-scaled diagonal (origin at voxel 0).
-  const px = (o: number) => dv.getFloat32(o, true) || 1
-  return [
-    [px(80), 0, 0, 0],
-    [0, px(84), 0, 0],
-    [0, 0, px(88), 0],
-    [0, 0, 0, 1],
-  ]
-}
-
-async function gunzipAll(file: File): Promise<Uint8Array> {
+async function gunzipAll(
+  file: File,
+  maxBytes = Number.POSITIVE_INFINITY,
+): Promise<Uint8Array> {
   const sig = new Uint8Array(await file.slice(0, 2).arrayBuffer())
   if (!(sig[0] === 0x1f && sig[1] === 0x8b)) {
+    if (file.size > maxBytes) throw tooLargeError(file.size, maxBytes)
     return new Uint8Array(await file.arrayBuffer())
   }
+  // Peek the gzip trailer; reject up front if the decompressed image clearly
+  // can't fit (only meaningful when it exceeds the budget — ISIZE wraps ≥ 4 GiB).
+  const isize = await gzipUncompressedSize(file)
+  if (isize > maxBytes) throw tooLargeError(isize, maxBytes)
   const reader = file
     .stream()
     .pipeThrough(new DecompressionStream('gzip'))
@@ -66,86 +58,17 @@ async function gunzipAll(file: File): Promise<Uint8Array> {
     if (done) break
     chunks.push(value)
     total += value.length
+    // Runtime backstop in case ISIZE wrapped (≥ 4 GiB) and slipped past the peek.
+    if (total > maxBytes) {
+      reader.cancel()
+      throw tooLargeError(total, maxBytes)
+    }
   }
   const out = new Uint8Array(total)
   let o = 0
   for (const c of chunks) {
     out.set(c, o)
     o += c.length
-  }
-  return out
-}
-
-function readNifti(bytes: Uint8Array): NiftiVol {
-  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-  if (dv.getInt32(0, true) !== 348) {
-    throw new Error(
-      'tracking: only NIfTI-1 (sizeof_hdr 348, little-endian) is supported.',
-    )
-  }
-  const dim0 = dv.getInt16(40, true)
-  const nx = dv.getInt16(42, true)
-  const ny = dv.getInt16(44, true)
-  const nz = dv.getInt16(46, true)
-  const nt = dim0 >= 4 ? Math.max(1, dv.getInt16(48, true)) : 1
-  const datatype = dv.getInt16(70, true)
-  let slope = dv.getFloat32(112, true)
-  const inter = dv.getFloat32(116, true)
-  if (slope === 0) slope = 1
-  const voxOffset = Math.round(dv.getFloat32(108, true)) || 352
-
-  const n = nx * ny * nz * nt
-  const raw = new Float32Array(n)
-  const base = bytes.byteOffset + voxOffset
-  const d = new DataView(bytes.buffer, base)
-  // Datatype codes per the NIfTI-1 spec.
-  const readers: Record<number, [number, (o: number) => number]> = {
-    2: [1, (o) => d.getUint8(o)],
-    4: [2, (o) => d.getInt16(o, true)],
-    8: [4, (o) => d.getInt32(o, true)],
-    16: [4, (o) => d.getFloat32(o, true)],
-    64: [8, (o) => d.getFloat64(o, true)],
-    256: [1, (o) => d.getInt8(o)],
-    512: [2, (o) => d.getUint16(o, true)],
-    768: [4, (o) => d.getUint32(o, true)],
-  }
-  const r = readers[datatype]
-  if (!r) throw new Error(`tracking: unsupported NIfTI datatype ${datatype}.`)
-  const [size, get] = r
-  for (let i = 0; i < n; i++) raw[i] = get(i * size) * slope + inter
-  return { nx, ny, nz, nt, raw, affine: readAffine(dv) }
-}
-
-// raw (x fastest) → dataf (x*ny*nz*nt + y*nz*nt + z*nt + t), t fastest.
-function reorderDataf(v: NiftiVol): Float32Array {
-  const { nx, ny, nz, nt, raw } = v
-  const out = new Float32Array(raw.length)
-  const sliceXY = nx * ny
-  for (let t = 0; t < nt; t++) {
-    for (let z = 0; z < nz; z++) {
-      for (let y = 0; y < ny; y++) {
-        for (let x = 0; x < nx; x++) {
-          const src = x + y * nx + z * sliceXY + t * sliceXY * nz
-          const dst = ((x * ny + y) * nz + z) * nt + t
-          out[dst] = raw[src]
-        }
-      }
-    }
-  }
-  return out
-}
-
-// raw (x fastest) → metric_map (x*ny*nz + y*nz + z), z fastest.
-function reorderMetric(v: NiftiVol): Float32Array {
-  const { nx, ny, nz, raw } = v
-  const out = new Float32Array(nx * ny * nz)
-  const sliceXY = nx * ny
-  for (let z = 0; z < nz; z++) {
-    for (let y = 0; y < ny; y++) {
-      for (let x = 0; x < nx; x++) {
-        out[(x * ny + y) * nz + z] = raw[x + y * nx + z * sliceXY]
-      }
-    }
   }
   return out
 }
@@ -177,13 +100,16 @@ export interface AssembledInputs {
   dims3: [number, number, number]
 }
 
-/** Build the full TrackingInputs for the Boot/OPDT tracker, plus TRX geometry. */
+/** Build the full TrackingInputs for the Boot/OPDT tracker, plus TRX geometry.
+ *  `maxBufferBytes` (the GPU storage-buffer limit) lets the DWI read reject a
+ *  too-large volume up front rather than after a doomed multi-GB allocation. */
 export async function assembleTrackingInputs(
   dwiFile: File,
   faFile: File,
   bvalText: string,
   bvecText: string,
   sphere: Sphere,
+  maxBufferBytes = Number.POSITIVE_INFINITY,
 ): Promise<AssembledInputs> {
   const gt = gradientTable(bvalText, bvecText)
   const nDir = gt.dwiTheta.length
@@ -193,24 +119,29 @@ export async function assembleTrackingInputs(
   const { theta, phi } = sphereThetaPhi(sphere)
   const sampling = realShDescoteaux(theta, phi, shOrder).B // nVerts × nCoeff
 
-  const dwi = readNifti(await gunzipAll(dwiFile))
-  const fa = readNifti(await gunzipAll(faFile))
-  if (fa.nx !== dwi.nx || fa.ny !== dwi.ny || fa.nz !== dwi.nz) {
-    throw new Error(
-      'tracking: FA map and DWI have different spatial dimensions.',
-    )
-  }
+  // Read DWI then FA sequentially so their decompressed byte blobs don't pile up;
+  // each gunzip result is only referenced for the duration of its read.
+  const dwi = readDataf(
+    await gunzipAll(dwiFile, maxBufferBytes),
+    maxBufferBytes,
+  )
   if (dwi.nt !== gt.b0sMask.length) {
     throw new Error(
       `tracking: DWI has ${dwi.nt} volumes but bval lists ${gt.b0sMask.length}.`,
     )
   }
+  const fa = readMetric(await gunzipAll(faFile))
+  if (fa.nx !== dwi.nx || fa.ny !== dwi.ny || fa.nz !== dwi.nz) {
+    throw new Error(
+      'tracking: FA map and DWI have different spatial dimensions.',
+    )
+  }
 
   return {
     inputs: {
-      dataf: reorderDataf(dwi),
+      dataf: dwi.dataf,
       dims: [dwi.nx, dwi.ny, dwi.nz, dwi.nt],
-      metricMap: reorderMetric(fa),
+      metricMap: fa.metric,
       sphereVertices: sphere.vertices,
       sphereEdges: sphere.edges,
       H: f32(opdt.H),

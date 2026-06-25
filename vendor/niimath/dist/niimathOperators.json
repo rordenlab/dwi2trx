@@ -188,18 +188,6 @@
     ],
     "help": "affine registration to match 'base' (from AFNI 3dAllineate)"
   },
-  "warp": {
-    "args": [],
-    "help": "aff]"
-  },
-  "interp": {
-    "args": [],
-    "help": "linear]"
-  },
-  "final": {
-    "args": [],
-    "help": "cubic]"
-  },
   "deface": {
     "args": [
       "tmpl",
@@ -388,6 +376,10 @@
       "m"
     ],
     "help": "grow (>1) or shrink (<1) image. Method <m> (0=nearest,1=linear,2=spline,3=Lanczos,4=Mitchell)"
+  },
+  "robustfov": {
+    "args": [],
+    "help": "crop to a robust field of view (default 170mm) from the top of the head down, removing lower head/neck (emulates FSL robustfov); adjusts dim and sform/qform"
   },
   "round": {
     "args": [],

@@ -94,12 +94,6 @@ export interface ImageProcessorMethods {
     reslice_mask(mask: string | number): this;
     /** affine registration to match 'base' (from AFNI 3dAllineate) */
     allineate(base: string | number): this;
-    /** aff] */
-    warp(): this;
-    /** linear] */
-    interp(): this;
-    /** cubic] */
-    final(): this;
     /** deface using affine registration; default Hellinger cost */
     deface(tmpl: string | number, mask: string | number): this;
     /** skull-strip using template registration */
@@ -146,6 +140,8 @@ export interface ImageProcessorMethods {
     p(threads: string | number): this;
     /** grow (>1) or shrink (<1) image. Method <m> (0=nearest,1=linear,2=spline,3=Lanczos,4=Mitchell) */
     resize(X: string | number, Y: string | number, Z: string | number, m: string | number): this;
+    /** crop to a robust field of view (default 170mm) from the top of the head down, removing lower head/neck (emulates FSL robustfov); adjusts dim and sform/qform */
+    robustfov(): this;
     /** round voxels to the nearest integer */
     round(): this;
     /** linearly rescale intensities to the range 0–1 using global min/max */

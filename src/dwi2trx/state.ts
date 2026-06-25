@@ -29,7 +29,5 @@ export const state: {
   step: Step
   input?: DwiInput
   maps?: TensorMaps
-  /** Stage 3c output: tracked streamlines in VOX space (flat x,y,z per line). */
-  streamlines?: Float32Array[]
-  tracts?: File // Stage 3d (TRX) — written from `streamlines`
+  tracts?: File // Stage 3 output: the tracked streamlines serialized to TRX
 } = { step: 1 }

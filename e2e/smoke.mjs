@@ -23,6 +23,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -168,8 +169,7 @@ async function main() {
     // 4. save TRX -> capture the download -> parse it
     console.log('→ Save TRX')
     await page.click('#saveBtn')
-    const trxPath = await waitForDownload(downloadDir, '.trx', 30000)
-    const { count, positions } = parseTrx(readFileSync(trxPath))
+    const { count, positions } = await waitForParsedTrx(downloadDir, 30000)
     console.log(
       `→ TRX parsed: ${count} streamlines, ${positions} position floats`,
     )
@@ -213,16 +213,37 @@ async function waitForStatusError(page) {
   }
 }
 
-async function waitForDownload(dir, ext, timeoutMs) {
+// Wait for a finished, parseable TRX. Chrome can expose the final filename
+// before the bytes are fully readable, so filesystem stability alone is not
+// enough; parse success is the completion condition.
+async function waitForParsedTrx(dir, timeoutMs) {
   const deadline = Date.now() + timeoutMs
+  let lastSize = -1
+  let lastError = ''
   while (Date.now() < deadline) {
-    const done = readdirSync(dir).find(
-      (f) => f.endsWith(ext) && !f.endsWith('.crdownload'),
+    const entries = readdirSync(dir)
+    const inProgress = entries.some((f) => f.endsWith('.crdownload'))
+    const done = entries.find(
+      (f) => f.endsWith('.trx') && !f.endsWith('.crdownload'),
     )
-    if (done) return join(dir, done)
+    if (done && !inProgress) {
+      const path = join(dir, done)
+      const size = statSync(path).size
+      if (size > 0 && size === lastSize) {
+        try {
+          return parseTrx(readFileSync(path))
+        } catch (err) {
+          lastError = err?.message ?? String(err)
+        }
+      }
+      lastSize = size
+    }
     await sleep(200)
   }
-  throw new Error(`no ${ext} download appeared within ${timeoutMs}ms`)
+  throw new Error(
+    `no complete parseable .trx download appeared within ${timeoutMs}ms` +
+      (lastError ? `; last parse error: ${lastError}` : ''),
+  )
 }
 
 // Minimal TRX reader: it's a STORE zip with header.json + positions.3.float32.
